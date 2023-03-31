@@ -191,6 +191,7 @@ class TensorFactory:
         self.model = model
         self.graph = graph
         self.registry = dict()
+        self.keras_names = set()   # layer names used, to avoid conflict upon building model
 
     def get(self, index, layout=None, is_bias=False):
         """get a tflite tensor from graph based on id, remember in registry

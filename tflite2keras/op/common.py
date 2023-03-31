@@ -143,29 +143,18 @@ class Operator(T2KBase):
 
     def derive_name(self):
         """Derive a name for this layer"""
-        # breakdown "path/path/name;path/path/name" and count
-        votes = {}
-        for part in self.name.split(";"):
-            votes[part] = votes.get(part, 0) + 1
-            end = len(part)
-            while True:
-                end = part.rfind("/", 0, end)
-                if end == -1:
-                    end = len(part)
-                substr = part[:end]
-                votes[substr] = votes.get(substr, 0) + 1
-                if end == len(part):
-                    break
-        # find the best name
-        _, _, name = max((v,len(k),k) for k,v in votes.items())
-        name = name.split("/")
-        if len(name) > 1:
-            name = name[-2]
-        else:
-            name = name[-1]
-        name = name.replace(":","_")
+        # breakdown "model/model/layer/name;model/model/layer/name" to "layer"
+        name = self.name.split(";")[-1]
+        name = name.split("/")[:3]
+        name = name[-1]
+        name = name.replace(":", "_")
+        if name in self.TFactory.keras_names:
+            cand, n = f"{name}__0", 0
+            while cand in self.TFactory.keras_names:
+                n += 1
+                cand = f"{name}__{n}"
+            name = cand
         return name
-
 
 
 class OpFactory:

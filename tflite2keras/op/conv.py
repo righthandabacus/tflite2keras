@@ -162,7 +162,7 @@ class TransposeConv(Operator):
         self.parseInput(2)
 
         # weight
-        wlayout = Layout('OHWI', 'HWIO')
+        wlayout = Layout('OHWI', 'HWOI')
         wt = self.parseInput(1, wlayout)
 
         # FIXME: we don't have a model containing bias.
@@ -193,7 +193,7 @@ class TransposeConv(Operator):
         """Create TransposeConv2D layer but not set the weight"""
         from tensorflow.keras.layers import Conv2DTranspose
         kerasattrs = {
-            "filters": self.inputs[1].data.shape[0],
+            "filters": self.inputs[1].data.shape[-2],
             "kernel_size": attrs["kernel_shape"],
             "strides": attrs["strides"],
             "padding": attrs["auto_pad"],

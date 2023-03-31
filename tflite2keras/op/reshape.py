@@ -175,6 +175,7 @@ class Reshape(Operator):
             shape_t = self.inputs[1]
             layout = copy.deepcopy(o.layout)
             if layout is None:
+                return  # XXX can I?
                 raise ValueError("Requires layout description for <%s>" % i.name)
             shape_t.data = np.array(layout.transform(shape_t.data))
         else:
@@ -188,10 +189,10 @@ class Reshape(Operator):
         """Create Reshape layer but not set the weight"""
         from tensorflow.keras.layers import Reshape, Flatten
         kerasattrs = {
-            "target_shape": self.inputs[1].data.tolist(),
+            "target_shape": self.inputs[1].data.tolist()[1:],  # ignore batch axis
             "name": self.derive_name(),
         }
-        if kerasattrs["target_shape"] == [1, -1]:
+        if kerasattrs["target_shape"] == [-1]:
             del kerasattrs["target_shape"]
             layer = Flatten(**kerasattrs)
         else:

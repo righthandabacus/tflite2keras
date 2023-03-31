@@ -2,6 +2,7 @@ import logging
 import tflite
 
 from .common import Operator
+from ..tensor import TensorFactory
 
 logger = logging.getLogger('t2k.activation')
 
@@ -15,7 +16,7 @@ class Activation(Operator):
         tflite.BuiltinOperator.RELU6: 'Clip',
     }
 
-    def __init__(self, TFactory, index, preset_opcode=None):
+    def __init__(self, TFactory: TensorFactory, index: int, preset_opcode=None):
         super().__init__(TFactory, index)
 
         # TFLite op code of the activation, e.g. tflite.BuiltinOperator.RELU
@@ -79,18 +80,15 @@ class Activation(Operator):
     def transform(self):
         pass
 
-    def derive_name(self):
-        name = super().derive_name()
-        return name + "_act"
-
     def make_node(self, nodetype, inames, onames, **attrs):
         """Create activation layer"""
-        from tensorflow.keras.layers import ReLU, Activation
+        from tensorflow.keras.layers import ReLU, PReLU, Activation
 
-        opcode = self.model.OperatorCodes(self.tflite.OpcodeIndex()).BuiltinCode()
         kerasattrs = {
             "name": self.derive_name(),
         }
+        opcode = (self.preset_opcode or
+                  self.model.OperatorCodes(self.tflite.OpcodeIndex()).BuiltinCode())
         if opcode is tflite.BuiltinOperator.TANH:
             kerasattrs["activation"] = "tanh"
             layer = Activation(**kerasattrs)
@@ -99,6 +97,18 @@ class Activation(Operator):
             layer = Activation(**kerasattrs)
         elif opcode is tflite.BuiltinOperator.RELU:
             layer = ReLU(**kerasattrs)
+        elif opcode is tflite.BuiltinOperator.RELU6:
+            kerasattrs["max_value"] = self.inputs[2].data[0]
+            kerasattrs["threshold"] = self.inputs[1].data[0]
+            layer = ReLU(**kerasattrs)
+        elif opcode is tflite.BuiltinOperator.PRELU:
+            shared_axes = [1+n
+                           for n, (f, k) in enumerate(zip(self.inputs[0].shape[1:],
+                                                          self.inputs[1].shape))
+                           if f != k]
+            if shared_axes:
+                kerasattrs["shared_axes"] = shared_axes
+            layer = PReLU(**kerasattrs)
         else:
             raise NotImplementedError("to be implemented")
         logger.info("%s(%s)",

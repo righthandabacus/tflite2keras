@@ -65,7 +65,7 @@ class Pooling(Operator):
         pass
 
     def make_node(self, nodetype, inames, onames, **attrs):
-        """Create Conv2D layer but not set the weight (that would need the input shape provided)"""
+        """Create Pooling layer"""
         from tensorflow.keras.layers import AveragePooling2D, MaxPooling2D
         kerasattrs = {
             "pool_size": attrs["kernel_shape"],

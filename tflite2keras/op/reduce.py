@@ -60,3 +60,16 @@ class Reduce(Operator):
             axes = self.attrs['axes']
             axes = [axe if axe >= 0 else (axes + len(layout.perm)) for axe in axes]
             self.attrs['axes'] = [layout.perm.index(axe) for axe in axes]
+
+    def make_node(self, nodetype, inames, onames, **attrs):
+        """Create GlobalAveragePooling layer"""
+        from tensorflow.keras.layers import GlobalAveragePooling2D
+        kerasattrs = {
+            "keepdims": False,
+            "name": self.derive_name(),
+        }
+        layer = GlobalAveragePooling2D(**kerasattrs)
+        logger.info("%s(%s)",
+                    layer.__class__.__name__,
+                    ", ".join(f"{k}={repr(v)}" for k, v in kerasattrs.items()))
+        return layer
