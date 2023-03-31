@@ -3,7 +3,9 @@ graph per model supported yet.
 """
 
 import logging
+
 import tflite
+import tensorflow as tf
 
 from .common import T2KBase
 from .graph import Graph
@@ -65,7 +67,7 @@ class Model(T2KBase):
     def save(self, path: str):
         logger.debug("saving model as %s", path)
         assert(self.status.converted)
-        self.keras.save(path)
+        tf.keras.models.save_model(self.keras, path)
 
     @property
     def shorty(self):
