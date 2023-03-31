@@ -1,0 +1,276 @@
+from __future__ import annotations   # until Py311, treat annotations as strings
+
+import copy
+import logging
+import pprint
+from collections import defaultdict
+
+import tflite
+from tensorflow.keras.models import Model
+
+from .tensor import TensorFactory
+from .common import T2KBase
+from .layout import Layout
+from .op import OpFactory
+from .quantize import handleQuantizationTensor, foldFP16QuantPattern
+
+logger = logging.getLogger('t2k.graph')
+pp = pprint.PrettyPrinter(indent=4, width=100, compact=True, sort_dicts=True)
+
+
+class Graph(T2KBase):
+    def __init__(self, model: tflite.Model, graph: tflite.SubGraph):
+        super().__init__(model, graph)
+
+        self.ops = []   # the OP that has TFLite peer
+        self.op_all = []  # includes helper OP
+
+        self.inputs = []
+        self.outputs = []
+        self.initializer = set()
+        self.value_info = set()
+
+        self.tflite = graph
+        # TFLite tensors = KerasTensor or weights. TensorFactory: Extract
+        # tensors from TFLite based on indices from graph
+        self.TFactory = TensorFactory(model, graph)
+        # TFLite op = Keras layers. OpFactory: help extract layer-specific
+        # attributes (e.g., strides in conv)
+        self.OPCFactory = OpFactory(self.TFactory)
+
+        self.setInited()
+
+    def _collectOpAndTensor(self):
+        """Upon return, this function makes:
+            - all ops (i.e., layers) in list self.op_all
+            - all weight tensors in set self.initializer
+            - all dummy tensors (as layer input/output, only shape, no data) in set self.value_info
+        """
+        self.op_all.clear()
+
+        # collect operators
+        def _recursive(op):
+            for cur_op in op.pre:
+                _recursive(cur_op)
+            self.op_all.append(op)
+            for cur_op in op.post:
+                _recursive(cur_op)
+        for op in self.ops:
+            _recursive(op)
+
+        # collect tensors
+        assert len(self.op_all) > 0
+        self.initializer.clear()
+        self.value_info.clear()
+        for op in self.op_all:
+            for t in op.inputs + op.outputs:
+                if t.isInitializer:
+                    self.initializer.add(t)
+                else:
+                    self.value_info.add(t)
+
+    def parse(self):
+        logger = logging.getLogger("t2k.graph.parse")
+        # operators
+        for i in range(self.graph.OperatorsLength()):
+            logger.debug("Parsing operator: %d", i)
+            op = self.OPCFactory.create(i)
+            op.parse()
+            self.ops.append(op)
+
+        # inputs
+        for i in range(self.graph.InputsLength()):
+            logger.debug("Parsing input: %d", i)
+            # FIXME: assert they have been created.
+            index = self.graph.Inputs(i)
+            t = self.TFactory.get(index)
+            self.inputs.append(t)
+
+        # outputs
+        for i in range(self.graph.OutputsLength()):
+            logger.debug("Parsing output: %d", i)
+            index = self.graph.Outputs(i)
+            t = self.TFactory.get(index)
+            self.outputs.append(t)
+
+        self._collectOpAndTensor()
+
+        self.setParsed()
+
+    def validate(self):
+        """Validate ops and tensors in graph: They should fulfil some rules to
+        make the graph valid
+        """
+        self._collectOpAndTensor()
+        for op in self.op_all:
+            op.validate()
+        for t in self.initializer | self.value_info:
+            t.validate()
+
+    def convert(self, explicit_layouts=None, details=False):
+        """Convert a TFLite graph into Keras model. Only a subset of TFLite model is supported.
+
+        Args:
+            explicit_layouts: A dict to map tensor name into a pair of TFLite
+                              layout-Keras layout
+            details: If true, return both the Keras model and the dict of ops and tensors
+
+        Returns:
+            If details is False, only the functional Keras model converted from
+            TFLite. If details is True, a 3-tuple of Keras model, a dict of name
+            to op objects, and a dict of name to KerasTensor
+        """
+        logger = logging.getLogger("t2k.graph.convert")
+
+        # transforming tensor layout if explicit_layouts are specified for some layers
+        t_all = [t for op in self.ops for t in op.inputs+op.outputs if t.name in explicit_layouts]
+        for t in t_all:
+            assert t.layout is None
+            layouts = explicit_layouts[t.name]
+            assert len(layouts) == 2
+            t.layout = Layout(layouts[0], layouts[1])
+        self._propagateLayout()
+        self._collectOpAndTensor()
+
+        # remove TFLite quantization on weight tensors
+        foldFP16QuantPattern(self.ops)
+        self._collectOpAndTensor()
+
+        logger.debug("Translating quantization semantic...")
+        for t in self.value_info | self.initializer:
+            deqt = handleQuantizationTensor(self.TFactory, t)
+            for i, o in enumerate(self.outputs):
+                if o == t:
+                    self.outputs[i] = deqt
+        self._collectOpAndTensor()
+
+        logger.debug("Graph:\n%s", str(self))
+        self.validate()
+
+        op_all = {}                   # op name -> op object
+        op_input = defaultdict(list)  # TFLite tensor name -> list of op name (as input)
+        for op in self.op_all:
+            # transform each TFLite op into a Keras layer object stored in op.keras
+            # weights are still at op.inputs and not set to layers
+            #
+            # TFLite is optimized: If Dense layer is created with default
+            # setting, bias is init with all zero. Converting such layer to
+            # TFLite will have the bias removed as it has no effect. This may
+            # distort the attributes to the Keras object
+            op.convert()
+            assert len(op.outputs) == 1, "FIXME what layer is this?"
+            # remember this layer and its dependency to input tensors
+            op_all[op.name] = op
+            for op_in in op.inputs:
+                if op_in.isInitializer:
+                    continue
+                op_input[op_in.name].append(op.name)
+
+        # TODO combine activation into layers if supported
+
+        # populating KerasTensor from input until output
+        avail = {}   # name of all available tensor
+        to_walk = {}
+        for t in self.inputs:
+            to_walk[t.name] = t.keras
+        while to_walk:
+            tname, tkeras = to_walk.popitem()
+            avail[tname] = tkeras
+            for layername in op_input[tname]:
+                op = op_all[layername]
+                # if all input tensors are ready, get the output tensor
+                inputs = [x.name for x in op.inputs if not x.isInitializer]
+                outputs = [x.name for x in op.outputs if not x.isInitializer]
+                if any(x not in avail for x in inputs):
+                    continue
+                inputs = [avail[x] for x in inputs]
+                assert len(outputs) == 1, "FIXME what layer is this?"
+                assert outputs[0] not in avail, f"Tensor {outputs[0]} already computed!"
+                output = op.keras(inputs[0] if len(inputs) == 1 else inputs)
+                to_walk[outputs[0]] = output
+                # set weights to keras layer object
+                weights = [x.data for x in op.inputs if x.isInitializer]
+                if weights and op.type not in ["Reshape", "Resize", "Pad"]:
+                    op.keras.set_weights(weights)
+
+        # at this point, we should expect the graph output is ready
+        assert all(t.name in avail for t in self.outputs)
+        inputs = [avail[t.name] for t in self.inputs]
+        outputs = [avail[t.name] for t in self.outputs]
+        self.keras = Model(inputs=inputs, outputs=outputs, name=self.name)
+        self.setConverted()
+        if details:
+            return self.keras, op_all, avail
+        else:
+            return self.keras
+
+    def _propagateLayout(self):        # noqa: C901
+        """Populate layout transformations to tensors
+        """
+        logger = logging.getLogger("t2k.graph.prop")
+
+        # collect tensors
+        T_toWalk = set()
+        T_wild = set()
+        tensor_count = len(self.value_info) + len(self.initializer)
+        for t in self.value_info | self.initializer:
+            if t.layout is None:
+                T_wild.add(t)
+            else:
+                T_toWalk.add(t)
+        logger.debug("Propagation: %d tensors in total, %d to walk, %d at wild",
+                     tensor_count, len(T_toWalk), len(T_wild))
+
+        # propagrate layout across graph
+        T_ignored = set()
+        T_walked = set()
+        while T_toWalk:
+            T = T_toWalk.pop()
+            logger.debug("Propagation: walking %s", T.shorty)
+            for n in T.producers + T.consumers:
+                for t in n.propagatableTensors():
+                    if (t is T) or (t not in T_wild):
+                        continue
+                    assert t.layout is None
+                    T_wild.remove(t)
+                    if t.isScalar:
+                        T_ignored.add(t)
+                    else:
+                        logger.debug("Propagation: propagated to %s", t.shorty)
+                        t.layout = copy.deepcopy(T.layout)
+                        T_toWalk.add(t)
+            T_walked.add(T)
+        logger.debug("Propagation: wild tensors %d, ignored tensors %d",
+                     len(T_wild), len(T_ignored))
+
+        # update tensor and operator
+        for t in T_walked:
+            t.transform()
+        self._collectOpAndTensor()
+        for op in self.op_all:
+            op.transform()
+
+    def _dump(self, tag: str, container, useShorty: bool):
+        dump = ['[%s] %s' % (tag, e.shorty if useShorty else e) for e in container]
+        return "\n".join(dump)
+
+    @property
+    def shorty(self):
+        string = [
+            self._dump('OP', self.op_all, True),
+            self._dump('Input', self.inputs, True),
+            self._dump('Output', self.outputs, True),
+            self._dump('Initializer', self.initializer, True),
+            self._dump('Value Info', self.value_info, True),
+        ]
+        return "\n".join(string)
+
+    def __str__(self):
+        string = [
+            self._dump('OP', self.op_all, False),
+            self._dump('Input', self.inputs, False),
+            self._dump('Output', self.outputs, False),
+            self._dump('Initializer', self.initializer, False),
+            self._dump('Value Info', self.value_info, False),
+        ]
+        return "\n".join(string)
