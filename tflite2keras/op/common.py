@@ -122,9 +122,9 @@ class Operator(T2KBase):
         self.attrs['name'] = self.name
         inames = [t.name for t in self.inputs]
         onames = [t.name for t in self.outputs]
-        # [AT] all Operator class must implement make_node() method to return a
-        #      Keras object. After all operators in the graph are set up, we
-        #      can walk through the graph again to create the KerasTensor
+        # all Operator class must implement make_node() method to return a Keras object.
+        # After all operators in the graph are set up, we can walk through the graph again
+        # to create the KerasTensor
         self.keras = self.make_node(self.type, inames, onames, **self.attrs)
         self.setConverted()
 

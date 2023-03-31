@@ -20,7 +20,6 @@ class Model(T2KBase):
         super().__init__(model)
         self.tflite = model
         self.graphs: list[Graph] = []
-        # [AT] set status to initialized
         self.setInited()
 
     def parse(self):
