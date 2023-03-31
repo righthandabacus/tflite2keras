@@ -145,6 +145,66 @@ class Graph(T2KBase):
         toposorted = list(_tsort(sources))
         return toposorted
 
+    @staticmethod
+    def _fix_transpose_bias(op_all, op_input, op_output):
+        # Hack: Some TFLite model will use Add operation to insert bias to ConvTranspose
+        consts = {}
+        for name, op in op_all.items():
+            if all(t.isInitializer for t in op.inputs):
+                # all-constant ops, this is the bias to ConvTranspose
+                op = op_all[name]
+                assert op.type == "Reshape", "Only reshape constant op is expected"
+                assert all(x==1 for x in op.keras.target_shape[:-1])  # expect shape (1,1,1,n)
+                consts[op.outputs[0].name] = op.inputs[0]
+        for opname in [o for k in consts for o in op_input[k]]:
+            op = op_all[opname]
+            assert op.type == "Add", "Only Add op expected to use constant tensor"
+            assert len(op.inputs) == 2, "Only Add of two inputs are expected with constant tensor"
+            other_in = [x for x in op.inputs if x.name not in consts][0]
+            const_in = [x for x in op.inputs if x.name in consts][0]
+            assert len(other_in.shape) == len(const_in.shape) == 4
+            assert other_in.shape[0] == const_in.shape[0] == 1
+            assert const_in.shape[1] == const_in.shape[2] == 1
+            assert other_in.shape[3] == const_in.shape[3]
+            assert consts[const_in.name].data.ndim == 1
+            assert len(consts[const_in.name].data) == const_in.shape[3]
+            assert len(op_input[const_in.name]) == 1
+            producer = op_all[op_output[other_in.name]]
+            assert producer.type == "ConvTranspose"
+            assert len(producer.inputs) == 2, "Expecting a ConvTranspose with no bias"
+            # append the bias to ConvTranspose, replace ConvTranspose output to Add's output
+            producer.inputs.append(consts[const_in.name])
+            producer.outputs = op.outputs
+            op_output[producer.outputs[0].name] = producer.name
+            # remove the Add operation from DAG
+            del op_input[other_in.name]
+            del op_input[const_in.name]
+            # update Keras object
+            config = producer.keras.get_config()
+            config["use_bias"] = True
+            producer.keras = producer.keras.from_config(config)
+
+    @staticmethod
+    def _fuse_activations(op_all, op_input, op_output):
+        """Fuse activation layer to the previous layer, fusing only supported
+        for Conv and FC layers
+        """
+        for oname, op in op_all.items():
+            if op.type in ["Relu", "Tanh", "Sigmoid"]:
+                assert len(op.inputs) == len(op.outputs) == 1
+                # find the previous layer
+                prev_name = op_output[op.inputs[0].name]
+                prev_op = op_all[prev_name]
+                # rebuild the previous layer with activation fused
+                if prev_op.type not in ["Conv", "ConvTranspose", "Gemm"]:
+                    continue
+                config = prev_op.keras.get_config()
+                config["activation"] = op.type.lower()
+                prev_op.keras = prev_op.keras.from_config(config)
+                # reset the output, and remove myself
+                prev_op.outputs = op.outputs
+                del op_input[op.inputs[0].name]
+                op_output[op.outputs[0].name] = prev_op.name
 
     def convert(self, explicit_layouts=None, details=False):
         """Convert a TFLite graph into Keras model. Only a subset of TFLite model is supported.
@@ -213,21 +273,13 @@ class Graph(T2KBase):
                     continue
                 op_output[op_out.name] = op.name
 
-        # TODO combine activation into layers if supported
+        # Clean-up Keras design: Combine ConvTranpose bias logic and fuse activations
+        self._fix_transpose_bias(op_all, op_input, op_output)
+        self._fuse_activations(op_all, op_input, op_output)
 
         # populating KerasTensor from input until output
-        avail = {t.name: t.keras for t in self.inputs}
         topoorder = self.toposort(op_input, op_output)
-        for name, op in op_all.items():
-            if all(t.isInitializer for t in op.inputs):
-                # all-constant ops, this will not be found by toposort and need to add manually
-                op = op_all[name]
-                assert op.type == "Reshape", "Only reshape constant op is supported yet"
-                data = op.inputs[0].data
-                if data.ndim == 1:
-                    data = data.reshape(1, -1)  # add batch axis
-                data = tf.constant(data)
-                avail[op.outputs[0].name] = op.keras(data)
+        avail = {t.name: t.keras for t in self.inputs}
         for tname in reversed(topoorder):
             if tname in avail:
                 # when tname is an input/output tensor

@@ -66,7 +66,7 @@ class Model(T2KBase):
 
     def save(self, path: str):
         logger.debug("saving model as %s", path)
-        assert(self.status.converted)
+        assert self.status.converted
         tf.keras.models.save_model(self.keras, path)
 
     @property
