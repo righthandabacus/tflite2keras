@@ -56,6 +56,3 @@ def cmd_convert():
     args = parser.parse_args()
 
     convert(args.tflite_path, args.keras_path)
-
-if __name__ == "__main__":
-    cmd_convert()

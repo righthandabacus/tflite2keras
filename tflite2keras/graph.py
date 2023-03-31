@@ -6,6 +6,7 @@ import pprint
 from collections import defaultdict
 
 import tflite
+import tensorflow as tf
 from tensorflow.keras.models import Model
 
 from .tensor import TensorFactory
@@ -27,8 +28,8 @@ class Graph(T2KBase):
 
         self.inputs = []
         self.outputs = []
-        self.initializer = set()
-        self.value_info = set()
+        self.initializer = set()   # tensors with data, i.e., weights and biases
+        self.value_info = set()    # placeholder tensors
 
         self.tflite = graph
         # TFLite tensors = KerasTensor or weights. TensorFactory: Extract
@@ -107,6 +108,44 @@ class Graph(T2KBase):
         for t in self.initializer | self.value_info:
             t.validate()
 
+    @staticmethod
+    def toposort(op_input, op_output):
+        """Return topological sorted order of output tensors
+
+        Args:
+            op_input: Dict of tensor name to list of consumer op names
+            op_output: Dict of tensor name to producer op name
+
+        Return:
+            list of name of topologically sorted order of output tensors, which
+            the first element is a sick of the DAG and last element is a source
+        """
+        # make a dict of opname -> output tensor name
+        ops = {v: k for k, v in op_output.items()}
+        # make a dict of input tenor name -> list of output tensor names; this is a DAG
+        graph = {k: [ops[n] for n in v] for k, v in op_input.items()}
+
+        # topological sort start with the source nodes and end with sinks
+        def _tsort(loopover):
+            "Recursive topological sorter"
+            for n in loopover:
+                if n in seen:
+                    continue
+                elif n not in graph:
+                    seen.add(n)
+                    yield n  # this is a sink
+                else:
+                    unseen = [m for m in graph[n] if m not in seen]
+                    yield from _tsort(unseen)
+                    seen.add(n)
+                    yield n
+
+        seen = set()
+        sources = [x for x in op_input if x not in op_output]
+        toposorted = list(_tsort(sources))
+        return toposorted
+
+
     def convert(self, explicit_layouts=None, details=False):
         """Convert a TFLite graph into Keras model. Only a subset of TFLite model is supported.
 
@@ -123,6 +162,7 @@ class Graph(T2KBase):
         logger = logging.getLogger("t2k.graph.convert")
 
         # transforming tensor layout if explicit_layouts are specified for some layers
+        explicit_layouts = explicit_layouts or {}
         t_all = [t for op in self.ops for t in op.inputs+op.outputs if t.name in explicit_layouts]
         for t in t_all:
             assert t.layout is None
@@ -148,7 +188,8 @@ class Graph(T2KBase):
         self.validate()
 
         op_all = {}                   # op name -> op object
-        op_input = defaultdict(list)  # TFLite tensor name -> list of op name (as input)
+        op_input = defaultdict(list)  # TFLite tensor name -> list of consumer op name
+        op_output = {}                # TFLite tensor name -> producer op name
         for op in self.op_all:
             # transform each TFLite op into a Keras layer object stored in op.keras
             # weights are still at op.inputs and not set to layers
@@ -159,39 +200,47 @@ class Graph(T2KBase):
             # distort the attributes to the Keras object
             op.convert()
             assert len(op.outputs) == 1, "FIXME what layer is this?"
-            # remember this layer and its dependency to input tensors
+            # remember this layer as consumer of input tensors
             op_all[op.name] = op
+            self.TFactory.keras_names.add(op.keras.name)
             for op_in in op.inputs:
                 if op_in.isInitializer:
                     continue
                 op_input[op_in.name].append(op.name)
+            # remember this layer as producer of output tensors
+            for op_out in op.outputs:
+                if op_out.isInitializer:
+                    continue
+                op_output[op_out.name] = op.name
 
         # TODO combine activation into layers if supported
 
         # populating KerasTensor from input until output
-        avail = {}   # name of all available tensor
-        to_walk = {}
-        for t in self.inputs:
-            to_walk[t.name] = t.keras
-        while to_walk:
-            tname, tkeras = to_walk.popitem()
-            avail[tname] = tkeras
-            for layername in op_input[tname]:
-                op = op_all[layername]
-                # if all input tensors are ready, get the output tensor
-                inputs = [x.name for x in op.inputs if not x.isInitializer]
-                outputs = [x.name for x in op.outputs if not x.isInitializer]
-                if any(x not in avail for x in inputs):
-                    continue
-                inputs = [avail[x] for x in inputs]
-                assert len(outputs) == 1, "FIXME what layer is this?"
-                assert outputs[0] not in avail, f"Tensor {outputs[0]} already computed!"
-                output = op.keras(inputs[0] if len(inputs) == 1 else inputs)
-                to_walk[outputs[0]] = output
-                # set weights to keras layer object
-                weights = [x.data for x in op.inputs if x.isInitializer]
-                if weights and op.type not in ["Reshape", "Resize", "Pad"]:
-                    op.keras.set_weights(weights)
+        avail = {t.name: t.keras for t in self.inputs}
+        topoorder = self.toposort(op_input, op_output)
+        for name, op in op_all.items():
+            if all(t.isInitializer for t in op.inputs):
+                # all-constant ops, this will not be found by toposort and need to add manually
+                op = op_all[name]
+                assert op.type == "Reshape", "Only reshape constant op is supported yet"
+                data = op.inputs[0].data
+                if data.ndim == 1:
+                    data = data.reshape(1, -1)  # add batch axis
+                data = tf.constant(data)
+                avail[op.outputs[0].name] = op.keras(data)
+        for tname in reversed(topoorder):
+            if tname in avail:
+                # when tname is an input/output tensor
+                continue
+            # create output KerasTensor
+            op = op_all[op_output[tname]]
+            inputs = [x.name for x in op.inputs if not x.isInitializer]
+            inputs = [avail[x] for x in inputs]
+            avail[tname] = op.keras(inputs[0] if len(inputs) == 1 else inputs)
+            # set weights to Keras layer object
+            weights = [x.data for x in op.inputs if x.isInitializer]
+            if weights and op.type not in ["Reshape", "Resize", "Pad", "Clip"]:
+                op.keras.set_weights(weights)
 
         # at this point, we should expect the graph output is ready
         assert all(t.name in avail for t in self.outputs)
