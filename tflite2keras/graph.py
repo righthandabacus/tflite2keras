@@ -278,6 +278,7 @@ class Graph(T2KBase):
         self._fuse_activations(op_all, op_input, op_output)
 
         # populating KerasTensor from input until output
+        # TODO code generation can be piggybacked here!
         topoorder = self.toposort(op_input, op_output)
         avail = {t.name: t.keras for t in self.inputs}
         for tname in reversed(topoorder):

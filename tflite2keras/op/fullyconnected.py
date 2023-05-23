@@ -76,6 +76,8 @@ class FullyConnected(Operator):
             "units": self.inputs[1].data.shape[-1],
             "name": self.derive_name(),
         }
+        if len(self.inputs) == 3 and (self.inputs[-1].data == 0).all():
+            self.inputs = self.inputs[:-1]
         if len(self.inputs) == 2:
             kerasattrs["use_bias"] = False
         layer = Dense(**kerasattrs)

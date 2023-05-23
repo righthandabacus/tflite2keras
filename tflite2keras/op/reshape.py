@@ -196,6 +196,7 @@ class Reshape(Operator):
             del kerasattrs["target_shape"]
             layer = Flatten(**kerasattrs)
         else:
+            kerasattrs["target_shape"] = self.outputs[0].shape[1:]
             layer = Reshape(**kerasattrs)
         logger.info("%s(%s)",
                     layer.__class__.__name__,

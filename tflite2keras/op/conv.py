@@ -103,6 +103,8 @@ class Conv(Operator):
         }
         if attrs["auto_pad"] is None:
             raise NotImplementedError("Padding other than `valid` and `same` are not implemented")
+        if len(self.inputs) == 3 and (self.inputs[-1].data == 0).all():
+            self.inputs = self.inputs[:-1]
         if len(self.inputs) == 2:
             kerasattrs["use_bias"] = False
         if self.isDepthwise:
@@ -202,6 +204,8 @@ class TransposeConv(Operator):
         }
         if attrs["auto_pad"] is None:
             raise NotImplementedError("Padding other than `valid` and `same` are not implemented")
+        if len(self.inputs) == 3 and (self.inputs[-1].data == 0).all():
+            self.inputs = self.inputs[:-1]
         if len(self.inputs) == 2:
             kerasattrs["use_bias"] = False
         layer = Conv2DTranspose(**kerasattrs)
